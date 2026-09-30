@@ -208,3 +208,10 @@ echo "  systemctl status ethercat"
 echo "  lsmod | grep -E 'ec_master|ec_igb'"
 echo "  sudo ethercat master"
 echo "  sudo ethercat slaves"
+
+if ldconfig -p | grep -q "libethercat.so.1"; then
+    echo "[OK] libethercat.so.1 is registered."
+else
+    echo "[ERROR] libethercat.so.1 was not found in ldconfig cache."
+    exit 1
+fi
