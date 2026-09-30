@@ -82,9 +82,10 @@ log "Generating configure"
 log "Configuring native ec_igb for Linux 6.12"
 ./configure \
     --enable-igb \
-    --disable-generic \
-    --disable-8139too \
-    --sysconfdir=/etc
+    --enable-8139too \
+    --enable-generic \
+    --enable-igb \
+    --sysconfdir=/etc 
 
 grep -q 'S\["ENABLE_IGB"\]="1"' config.status || \
     die "ENABLE_IGB is not 1 after configure."
