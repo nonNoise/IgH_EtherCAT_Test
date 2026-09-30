@@ -1,26 +1,39 @@
 /*
  * ec_jitter.c
  *
- * IgH EtherCAT Timing Benchmark
+ * IgH EtherCAT FreeRun Timing Benchmark
  *
- * Fixed frequencies:
- *   1, 5, 10, 15, 20, 25, 50, 75, 100 kHz
+ * Purpose:
+ *   Compare EtherCAT master timing performance between NIC/driver combinations.
  *
- * Modes:
- *   1. FreeRun
- *      - No master DC synchronization calls
+ * Examples:
  *
- *   2. DC Sync
- *      - ecrt_master_application_time() every cycle
- *      - DC clock correction at fixed 1 kHz
- *      - DC monitor at fixed 100 Hz
+ *   Intel I210 + ec_igb
+ *   Raspberry Pi Ethernet + ec_generic
  *
- * Measurements:
- *   Wake Jit  : Linux wake-up lateness
- *   Send Jit  : interval error between ecrt_master_send() calls
- *   Exec      : receive -> processing -> send execution time
- *   DC Max    : maximum DC synchronization difference
- *   Overrun   : wake-up >= one target cycle late
+ * No PDO configuration.
+ * No DC synchronization.
+ * No external JSON.
+ *
+ * Every cycle, this benchmark tries to read:
+ *
+ *   ESC register 0x0130 : AL Status
+ *   Size                : 2 bytes
+ *
+ * Slave position 0 is detected automatically.
+ * Vendor ID and Product Code are read automatically from the slave.
+ *
+ * Frequencies:
+ *
+ *   1 kHz
+ *   5 kHz
+ *   10 kHz
+ *   15 kHz
+ *   20 kHz
+ *   25 kHz
+ *   50 kHz
+ *   75 kHz
+ *   100 kHz
  *
  * Build:
  *
@@ -61,25 +74,31 @@
  * ============================================================ */
 
 #define MASTER_INDEX            0
+
+/*
+ * Slave physical ring position.
+ *
+ * Position 0 = first EtherCAT slave.
+ */
+#define SLAVE_POSITION          0
+#define SLAVE_ALIAS             0
+
+
+/*
+ * ESC register used for benchmark.
+ *
+ * 0x0130 = AL Status
+ *
+ * Read only.
+ */
+#define ESC_REGISTER_ADDRESS    0x0130
+#define ESC_REGISTER_SIZE       2
+
+
 #define RT_PRIORITY             80
 
 #define WARMUP_SECONDS          2
 #define TEST_SECONDS            10
-
-/*
- * DC correction frequency is fixed.
- *
- * Important:
- * Do not execute DC correction at every benchmark cycle,
- * otherwise a 100 kHz test would perform 100x more DC
- * correction operations than a 1 kHz test.
- */
-#define DC_SYNC_HZ              1000
-
-/*
- * DC synchronization monitor frequency.
- */
-#define DC_MONITOR_HZ           100
 
 
 static const unsigned int test_frequencies[] =
@@ -95,27 +114,15 @@ static const unsigned int test_frequencies[] =
     100000
 };
 
+
 #define NUM_TEST_FREQS \
     (sizeof(test_frequencies) / sizeof(test_frequencies[0]))
 
-#define MAX_TEST_HZ 100000
+
+#define MAX_TEST_HZ             100000
 
 #define MAX_SAMPLES \
     ((size_t)MAX_TEST_HZ * TEST_SECONDS)
-
-#define EPOCH_2000_OFFSET_SEC 946684800ULL
-
-
-/* ============================================================
- * Test mode
- * ============================================================ */
-
-typedef enum
-{
-    MODE_FREERUN = 0,
-    MODE_DC      = 1
-
-} benchmark_mode_t;
 
 
 /* ============================================================
@@ -128,26 +135,32 @@ typedef struct
 
     uint64_t period_ns;
 
-    size_t samples;
-    size_t dc_samples;
+    size_t cycle_samples;
+    size_t send_samples;
+    size_t rtt_samples;
 
     double wake_p999_us;
     double wake_max_us;
 
     double send_p999_us;
-    double send_max_abs_us;
+    double send_max_us;
 
     double exec_p999_us;
     double exec_max_us;
 
-    double dc_p99_us;
-    double dc_max_us;
+    double rtt_p99_us;
+    double rtt_p999_us;
+    double rtt_max_us;
 
-    uint64_t overruns;
+    uint64_t late_events;
+    uint64_t skipped_cycles;
 
     uint64_t receive_errors;
     uint64_t send_errors;
-    uint64_t dc_errors;
+
+    uint64_t reg_success;
+    uint64_t reg_errors;
+    uint64_t reg_busy_cycles;
 
 } test_result_t;
 
@@ -160,23 +173,24 @@ static volatile sig_atomic_t stop_requested = 0;
 
 static ec_master_t *master = NULL;
 
+static ec_slave_config_t *slave_config = NULL;
+
+static ec_reg_request_t *reg_request = NULL;
+
 
 /*
- * Reused measurement buffers.
- *
- * 100 kHz * 10 sec = 1,000,000 samples.
+ * Measurement arrays.
  */
-static int64_t  *wake_samples = NULL;
-static int64_t  *send_interval_samples = NULL;
+static int64_t *wake_samples = NULL;
+static int64_t *send_samples = NULL;
+
 static uint64_t *exec_samples = NULL;
-static uint32_t *dc_samples = NULL;
+static uint64_t *rtt_samples = NULL;
 
 
-static test_result_t freerun_results[NUM_TEST_FREQS];
-static test_result_t dc_results[NUM_TEST_FREQS];
+static test_result_t results[NUM_TEST_FREQS];
 
-static size_t freerun_result_count = 0;
-static size_t dc_result_count = 0;
+static size_t result_count = 0;
 
 
 /* ============================================================
@@ -223,33 +237,6 @@ static inline void timespec_add_ns(
 }
 
 
-/*
- * EtherCAT application time:
- *
- * ns since 2000-01-01.
- */
-static uint64_t get_ethercat_application_time(void)
-{
-    struct timespec ts;
-
-    clock_gettime(
-        CLOCK_REALTIME,
-        &ts);
-
-    uint64_t sec =
-        (uint64_t)ts.tv_sec;
-
-    if (sec < EPOCH_2000_OFFSET_SEC)
-        return 0;
-
-    return
-        (sec - EPOCH_2000_OFFSET_SEC)
-        * 1000000000ULL
-        +
-        (uint64_t)ts.tv_nsec;
-}
-
-
 /* ============================================================
  * Sorting
  * ============================================================ */
@@ -258,11 +245,12 @@ static int cmp_i64(
     const void *a,
     const void *b)
 {
-    int64_t aa =
+    const int64_t aa =
         *(const int64_t *)a;
 
-    int64_t bb =
+    const int64_t bb =
         *(const int64_t *)b;
+
 
     if (aa < bb)
         return -1;
@@ -278,31 +266,12 @@ static int cmp_u64(
     const void *a,
     const void *b)
 {
-    uint64_t aa =
+    const uint64_t aa =
         *(const uint64_t *)a;
 
-    uint64_t bb =
+    const uint64_t bb =
         *(const uint64_t *)b;
 
-    if (aa < bb)
-        return -1;
-
-    if (aa > bb)
-        return 1;
-
-    return 0;
-}
-
-
-static int cmp_u32(
-    const void *a,
-    const void *b)
-{
-    uint32_t aa =
-        *(const uint32_t *)a;
-
-    uint32_t bb =
-        *(const uint32_t *)b;
 
     if (aa < bb)
         return -1;
@@ -325,27 +294,34 @@ static size_t percentile_index(
     if (count == 0)
         return 0;
 
+
     double pos =
         percentile *
         (double)(count - 1);
 
+
     size_t index =
         (size_t)ceil(pos);
 
+
     if (index >= count)
         index = count - 1;
+
 
     return index;
 }
 
 
-static int64_t abs_i64_safe(int64_t value)
+static int64_t abs_i64_safe(
+    int64_t value)
 {
     if (value == INT64_MIN)
         return INT64_MAX;
 
+
     if (value < 0)
         return -value;
+
 
     return value;
 }
@@ -357,100 +333,27 @@ static int64_t max_abs_i64(
 {
     int64_t max_value = 0;
 
+
     for (size_t i = 0;
          i < count;
          i++)
     {
         int64_t value =
-            abs_i64_safe(data[i]);
+            abs_i64_safe(
+                data[i]);
+
 
         if (value > max_value)
             max_value = value;
     }
+
 
     return max_value;
 }
 
 
 /* ============================================================
- * CPU affinity
- * ============================================================ */
-
-static void configure_cpu_affinity(void)
-{
-    long cpu_count =
-        sysconf(_SC_NPROCESSORS_ONLN);
-
-    if (cpu_count <= 0)
-        return;
-
-    /*
-     * Use highest-numbered CPU.
-     *
-     * RPi4 / RPi5 normally -> CPU3.
-     */
-    int cpu =
-        (int)cpu_count - 1;
-
-    cpu_set_t cpuset;
-
-    CPU_ZERO(&cpuset);
-    CPU_SET(cpu, &cpuset);
-
-    if (sched_setaffinity(
-            0,
-            sizeof(cpuset),
-            &cpuset) != 0)
-    {
-        perror("sched_setaffinity");
-    }
-}
-
-
-/* ============================================================
- * Realtime scheduler
- * ============================================================ */
-
-static void configure_realtime(void)
-{
-    struct sched_param sp;
-
-    memset(
-        &sp,
-        0,
-        sizeof(sp));
-
-    sp.sched_priority =
-        RT_PRIORITY;
-
-    if (sched_setscheduler(
-            0,
-            SCHED_FIFO,
-            &sp) != 0)
-    {
-        perror("sched_setscheduler");
-    }
-}
-
-
-static void restore_normal_scheduler(void)
-{
-    struct sched_param sp;
-
-    memset(
-        &sp,
-        0,
-        sizeof(sp));
-
-    sched_setscheduler(
-        0,
-        SCHED_OTHER,
-        &sp);
-}
-
-
-/* ============================================================
- * Frequency display
+ * Frequency formatting
  * ============================================================ */
 
 static void format_frequency(
@@ -478,10 +381,107 @@ static void format_frequency(
 
 
 /* ============================================================
- * Clear buffers
+ * CPU affinity
  * ============================================================ */
 
-static void clear_measurement_buffers(void)
+static int configure_cpu_affinity(void)
+{
+    long cpu_count =
+        sysconf(
+            _SC_NPROCESSORS_ONLN);
+
+
+    if (cpu_count <= 0)
+        return -1;
+
+
+    /*
+     * Use last online CPU.
+     *
+     * Raspberry Pi 4/5 normally:
+     * CPU 3.
+     */
+    int cpu =
+        (int)cpu_count - 1;
+
+
+    cpu_set_t set;
+
+    CPU_ZERO(&set);
+
+    CPU_SET(
+        cpu,
+        &set);
+
+
+    if (sched_setaffinity(
+            0,
+            sizeof(set),
+            &set) != 0)
+    {
+        return -1;
+    }
+
+
+    return cpu;
+}
+
+
+/* ============================================================
+ * Realtime scheduling
+ * ============================================================ */
+
+static int configure_realtime(void)
+{
+    struct sched_param sp;
+
+
+    memset(
+        &sp,
+        0,
+        sizeof(sp));
+
+
+    sp.sched_priority =
+        RT_PRIORITY;
+
+
+    if (sched_setscheduler(
+            0,
+            SCHED_FIFO,
+            &sp) != 0)
+    {
+        return -1;
+    }
+
+
+    return 0;
+}
+
+
+static void restore_scheduler(void)
+{
+    struct sched_param sp;
+
+
+    memset(
+        &sp,
+        0,
+        sizeof(sp));
+
+
+    sched_setscheduler(
+        0,
+        SCHED_OTHER,
+        &sp);
+}
+
+
+/* ============================================================
+ * Measurement buffer reset
+ * ============================================================ */
+
+static void clear_buffers(void)
 {
     memset(
         wake_samples,
@@ -489,11 +489,13 @@ static void clear_measurement_buffers(void)
         MAX_SAMPLES *
         sizeof(*wake_samples));
 
+
     memset(
-        send_interval_samples,
+        send_samples,
         0,
         MAX_SAMPLES *
-        sizeof(*send_interval_samples));
+        sizeof(*send_samples));
+
 
     memset(
         exec_samples,
@@ -501,21 +503,62 @@ static void clear_measurement_buffers(void)
         MAX_SAMPLES *
         sizeof(*exec_samples));
 
+
     memset(
-        dc_samples,
+        rtt_samples,
         0,
         MAX_SAMPLES *
-        sizeof(*dc_samples));
+        sizeof(*rtt_samples));
 }
 
 
 /* ============================================================
- * One benchmark
+ * Wait until slave scan is available
  * ============================================================ */
 
-static int run_frequency_test(
+static int wait_for_slave(
+    ec_slave_info_t *slave_info)
+{
+    /*
+     * ecrt_request_master() may return while the bus scan
+     * is still completing.
+     *
+     * Wait up to ~5 seconds.
+     */
+    for (int i = 0;
+         i < 50;
+         i++)
+    {
+        memset(
+            slave_info,
+            0,
+            sizeof(*slave_info));
+
+
+        if (ecrt_master_get_slave(
+                master,
+                SLAVE_POSITION,
+                slave_info) == 0)
+        {
+            return 0;
+        }
+
+
+        usleep(
+            100000);
+    }
+
+
+    return -1;
+}
+
+
+/* ============================================================
+ * Run one frequency
+ * ============================================================ */
+
+static int run_test(
     unsigned int hz,
-    benchmark_mode_t mode,
     test_result_t *result)
 {
     memset(
@@ -523,11 +566,15 @@ static int run_frequency_test(
         0,
         sizeof(*result));
 
+
     result->hz =
         hz;
 
+
     result->period_ns =
-        1000000000ULL / hz;
+        1000000000ULL /
+        hz;
+
 
     const uint64_t period_ns =
         result->period_ns;
@@ -537,62 +584,57 @@ static int run_frequency_test(
         (size_t)hz *
         WARMUP_SECONDS;
 
-    const size_t measurement_cycles =
+
+    const size_t measure_cycles =
         (size_t)hz *
         TEST_SECONDS;
 
+
     const size_t total_cycles =
         warmup_cycles +
-        measurement_cycles;
+        measure_cycles;
 
 
-    /*
-     * Since benchmark starts at 1 kHz,
-     * all frequencies are >= DC_SYNC_HZ.
-     */
-    unsigned int dc_sync_div =
-        hz / DC_SYNC_HZ;
-
-    if (dc_sync_div < 1)
-        dc_sync_div = 1;
-
-
-    unsigned int dc_monitor_div =
-        hz / DC_MONITOR_HZ;
-
-    if (dc_monitor_div < 1)
-        dc_monitor_div = 1;
-
-
-    size_t sample_count = 0;
+    size_t cycle_sample_count = 0;
     size_t send_sample_count = 0;
-    size_t dc_count = 0;
-
-
-    uint64_t overruns = 0;
-
-    uint64_t receive_errors = 0;
-    uint64_t send_errors = 0;
-    uint64_t dc_errors = 0;
+    size_t rtt_sample_count = 0;
 
 
     struct timespec target;
     struct timespec wake;
-    struct timespec exec_end;
     struct timespec send_time;
-    struct timespec previous_send_time;
-
-
-    bool previous_send_valid = false;
-    bool monitor_pending = false;
+    struct timespec previous_send;
+    struct timespec exec_end;
 
 
     /*
-     * Start first cycle 100 ms in the future.
+     * Register request start timestamp.
+     */
+    struct timespec reg_start;
+
+
+    bool previous_send_valid = false;
+    bool reg_start_valid = false;
+
+
+    uint64_t late_events = 0;
+    uint64_t skipped_cycles = 0;
+
+    uint64_t receive_errors = 0;
+    uint64_t send_errors = 0;
+
+    uint64_t reg_success = 0;
+    uint64_t reg_errors = 0;
+    uint64_t reg_busy_cycles = 0;
+
+
+    /*
+     * Start 100 ms in the future.
      */
     clock_gettime(
         CLOCK_MONOTONIC,
         &target);
+
 
     timespec_add_ns(
         &target,
@@ -608,9 +650,13 @@ static int run_frequency_test(
 
 
         /*
-         * Absolute-time sleep.
+         * ----------------------------------------------------
+         * Sleep until absolute deadline.
+         * ----------------------------------------------------
          */
+
         int sleep_ret;
+
 
         do
         {
@@ -643,29 +689,62 @@ static int run_frequency_test(
 
 
         /*
-         * Actual wake-up time.
+         * ----------------------------------------------------
+         * Wake timestamp.
+         * ----------------------------------------------------
          */
+
         clock_gettime(
             CLOCK_MONOTONIC,
             &wake);
 
 
-        int64_t wake_jitter_ns =
+        int64_t wake_lateness_ns =
             timespec_diff_ns(
                 &wake,
                 &target);
 
 
-        if (wake_jitter_ns >=
+        bool rebase_schedule = false;
+
+
+        /*
+         * If one or more periods have already passed,
+         * do NOT try to catch up by executing cycles back-to-back.
+         *
+         * Instead count skipped periods and restart from
+         * a future deadline.
+         */
+        if (wake_lateness_ns >=
             (int64_t)period_ns)
         {
-            overruns++;
+            late_events++;
+
+
+            uint64_t skipped =
+                (uint64_t)wake_lateness_ns /
+                period_ns;
+
+
+            if (skipped == 0)
+                skipped = 1;
+
+
+            skipped_cycles +=
+                skipped;
+
+
+            rebase_schedule =
+                true;
         }
 
 
         /*
-         * EtherCAT RX.
+         * ----------------------------------------------------
+         * Receive EtherCAT frames.
+         * ----------------------------------------------------
          */
+
         if (ecrt_master_receive(
                 master) != 0)
         {
@@ -674,147 +753,158 @@ static int run_frequency_test(
 
 
         /*
-         * DC mode only.
+         * ----------------------------------------------------
+         * Check register request result.
+         * ----------------------------------------------------
          */
-        if (mode == MODE_DC)
+
+        ec_request_state_t state =
+            ecrt_reg_request_state(
+                reg_request);
+
+
+        if (state == EC_REQUEST_SUCCESS)
         {
-            /*
-             * Retrieve previously queued monitor result.
-             */
-            if (monitor_pending)
+            reg_success++;
+
+
+            if (
+                reg_start_valid &&
+                cycle >= warmup_cycles &&
+                rtt_sample_count < MAX_SAMPLES)
             {
-                uint32_t dc =
-                    ecrt_master_sync_monitor_process(
-                        master);
+                struct timespec now;
 
-                if (dc == UINT32_MAX)
+
+                clock_gettime(
+                    CLOCK_MONOTONIC,
+                    &now);
+
+
+                int64_t rtt_ns =
+                    timespec_diff_ns(
+                        &now,
+                        &reg_start);
+
+
+                if (rtt_ns >= 0)
                 {
-                    dc_errors++;
-                }
-                else
-                {
-                    if (
-                        cycle >= warmup_cycles &&
-                        dc_count < MAX_SAMPLES)
-                    {
-                        dc_samples[
-                            dc_count++] = dc;
-                    }
-                }
-
-                monitor_pending = false;
-            }
-
-
-            /*
-             * Application time should be supplied cyclically
-             * while using distributed clocks.
-             */
-            uint64_t app_time =
-                get_ethercat_application_time();
-
-            if (ecrt_master_application_time(
-                    master,
-                    app_time) != 0)
-            {
-                dc_errors++;
-            }
-
-
-            /*
-             * Queue actual clock corrections at FIXED 1 kHz.
-             *
-             * 1 kHz benchmark:
-             *   every cycle
-             *
-             * 100 kHz benchmark:
-             *   every 100 cycles
-             */
-            if ((cycle % dc_sync_div) == 0)
-            {
-                if (ecrt_master_sync_reference_clock(
-                        master) != 0)
-                {
-                    dc_errors++;
-                }
-
-                if (ecrt_master_sync_slave_clocks(
-                        master) != 0)
-                {
-                    dc_errors++;
+                    rtt_samples[
+                        rtt_sample_count++]
+                        =
+                        (uint64_t)rtt_ns;
                 }
             }
 
 
-            /*
-             * Queue synchronization monitor at FIXED 100 Hz.
-             */
-            if ((cycle % dc_monitor_div) == 0)
+            reg_start_valid =
+                false;
+        }
+        else if (state == EC_REQUEST_ERROR)
+        {
+            reg_errors++;
+
+            reg_start_valid =
+                false;
+        }
+        else if (state == EC_REQUEST_BUSY)
+        {
+            reg_busy_cycles++;
+        }
+
+
+        /*
+         * ----------------------------------------------------
+         * Queue next ESC register read.
+         *
+         * Never queue a new request while the old request
+         * is BUSY.
+         * ----------------------------------------------------
+         */
+
+        state =
+            ecrt_reg_request_state(
+                reg_request);
+
+
+        if (state != EC_REQUEST_BUSY)
+        {
+            clock_gettime(
+                CLOCK_MONOTONIC,
+                &reg_start);
+
+
+            if (ecrt_reg_request_read(
+                    reg_request,
+                    ESC_REGISTER_ADDRESS,
+                    ESC_REGISTER_SIZE) == 0)
             {
-                if (!monitor_pending)
-                {
-                    if (ecrt_master_sync_monitor_queue(
-                            master) == 0)
-                    {
-                        monitor_pending = true;
-                    }
-                    else
-                    {
-                        dc_errors++;
-                    }
-                }
+                reg_start_valid =
+                    true;
+            }
+            else
+            {
+                reg_errors++;
+
+                reg_start_valid =
+                    false;
             }
         }
 
 
         /*
-         * Timestamp immediately before send().
+         * ----------------------------------------------------
+         * Timestamp immediately before ecrt_master_send().
          *
-         * This is the application-side cyclic send point.
+         * This measures application-side EtherCAT send timing.
+         * ----------------------------------------------------
          */
+
         clock_gettime(
             CLOCK_MONOTONIC,
             &send_time);
 
 
         /*
-         * Measure interval between send calls.
-         *
-         * This is useful for comparing:
-         *
-         *   bcmgenet
-         *   vs
-         *   Intel I210 / igb
+         * Measure actual interval between calls to send().
          */
         if (
             previous_send_valid &&
             cycle >= warmup_cycles &&
             send_sample_count < MAX_SAMPLES)
         {
-            int64_t send_interval_ns =
+            int64_t actual_interval_ns =
                 timespec_diff_ns(
                     &send_time,
-                    &previous_send_time);
+                    &previous_send);
 
-            send_interval_samples[
+
+            int64_t interval_error_ns =
+                actual_interval_ns -
+                (int64_t)period_ns;
+
+
+            send_samples[
                 send_sample_count++]
                 =
-                send_interval_ns
-                -
-                (int64_t)period_ns;
+                interval_error_ns;
         }
 
 
-        previous_send_time =
+        previous_send =
             send_time;
+
 
         previous_send_valid =
             true;
 
 
         /*
-         * EtherCAT TX.
+         * ----------------------------------------------------
+         * Send actual EtherCAT datagrams.
+         * ----------------------------------------------------
          */
+
         if (ecrt_master_send(
                 master) != 0)
         {
@@ -823,65 +913,102 @@ static int run_frequency_test(
 
 
         /*
-         * End timestamp.
+         * ----------------------------------------------------
+         * Loop execution time.
+         * ----------------------------------------------------
          */
+
         clock_gettime(
             CLOCK_MONOTONIC,
             &exec_end);
 
 
-        uint64_t exec_ns =
-            (uint64_t)
+        int64_t exec_ns =
             timespec_diff_ns(
                 &exec_end,
                 &wake);
 
 
+        if (exec_ns < 0)
+            exec_ns = 0;
+
+
         /*
-         * Store measurement after warmup.
+         * ----------------------------------------------------
+         * Save cycle measurements.
+         * ----------------------------------------------------
          */
+
         if (
             cycle >= warmup_cycles &&
-            sample_count < MAX_SAMPLES)
+            cycle_sample_count < MAX_SAMPLES)
         {
             wake_samples[
-                sample_count]
+                cycle_sample_count]
                 =
-                wake_jitter_ns;
+                wake_lateness_ns;
+
 
             exec_samples[
-                sample_count]
+                cycle_sample_count]
                 =
-                exec_ns;
+                (uint64_t)exec_ns;
 
-            sample_count++;
+
+            cycle_sample_count++;
         }
 
 
         /*
-         * Absolute schedule.
-         *
-         * Important:
-         * Never use "now + period".
+         * ----------------------------------------------------
+         * Next schedule.
+         * ----------------------------------------------------
          */
-        timespec_add_ns(
-            &target,
-            period_ns);
+
+        if (rebase_schedule)
+        {
+            /*
+             * Critical for high-frequency testing:
+             *
+             * Do NOT run old deadlines back-to-back.
+             */
+            target =
+                wake;
+
+
+            timespec_add_ns(
+                &target,
+                period_ns);
+        }
+        else
+        {
+            timespec_add_ns(
+                &target,
+                period_ns);
+        }
     }
 
 
     /* ========================================================
-     * Save statistics
+     * Save counters
      * ======================================================== */
 
-    result->samples =
-        sample_count;
+    result->cycle_samples =
+        cycle_sample_count;
 
-    result->dc_samples =
-        dc_count;
+    result->send_samples =
+        send_sample_count;
 
-    result->overruns =
-        overruns;
+    result->rtt_samples =
+        rtt_sample_count;
+
+
+    result->late_events =
+        late_events;
+
+    result->skipped_cycles =
+        skipped_cycles;
+
 
     result->receive_errors =
         receive_errors;
@@ -889,69 +1016,82 @@ static int run_frequency_test(
     result->send_errors =
         send_errors;
 
-    result->dc_errors =
-        dc_errors;
+
+    result->reg_success =
+        reg_success;
+
+    result->reg_errors =
+        reg_errors;
+
+    result->reg_busy_cycles =
+        reg_busy_cycles;
 
 
-    /*
+    /* ========================================================
      * Wake jitter
-     */
-    if (sample_count > 0)
+     * ======================================================== */
+
+    if (cycle_sample_count > 0)
     {
         qsort(
             wake_samples,
-            sample_count,
+            cycle_sample_count,
             sizeof(wake_samples[0]),
             cmp_i64);
+
 
         result->wake_p999_us =
             wake_samples[
                 percentile_index(
-                    sample_count,
+                    cycle_sample_count,
                     0.999)]
             /
             1000.0;
 
+
         result->wake_max_us =
             wake_samples[
-                sample_count - 1]
+                cycle_sample_count - 1]
             /
             1000.0;
     }
 
 
-    /*
+    /* ========================================================
      * Send interval jitter
-     */
+     *
+     * Use ABSOLUTE interval error for percentile comparison.
+     * ======================================================== */
+
     if (send_sample_count > 0)
     {
-        result->send_max_abs_us =
+        result->send_max_us =
             max_abs_i64(
-                send_interval_samples,
+                send_samples,
                 send_sample_count)
             /
             1000.0;
 
-        /*
-         * For P99.9 we compare absolute jitter.
-         */
+
         for (size_t i = 0;
              i < send_sample_count;
              i++)
         {
-            send_interval_samples[i] =
+            send_samples[i] =
                 abs_i64_safe(
-                    send_interval_samples[i]);
+                    send_samples[i]);
         }
 
+
         qsort(
-            send_interval_samples,
+            send_samples,
             send_sample_count,
-            sizeof(send_interval_samples[0]),
+            sizeof(send_samples[0]),
             cmp_i64);
 
+
         result->send_p999_us =
-            send_interval_samples[
+            send_samples[
                 percentile_index(
                     send_sample_count,
                     0.999)]
@@ -960,55 +1100,70 @@ static int run_frequency_test(
     }
 
 
-    /*
-     * Loop execution
-     */
-    if (sample_count > 0)
+    /* ========================================================
+     * Execution time
+     * ======================================================== */
+
+    if (cycle_sample_count > 0)
     {
         qsort(
             exec_samples,
-            sample_count,
+            cycle_sample_count,
             sizeof(exec_samples[0]),
             cmp_u64);
+
 
         result->exec_p999_us =
             exec_samples[
                 percentile_index(
-                    sample_count,
+                    cycle_sample_count,
                     0.999)]
             /
             1000.0;
 
+
         result->exec_max_us =
             exec_samples[
-                sample_count - 1]
+                cycle_sample_count - 1]
             /
             1000.0;
     }
 
 
-    /*
-     * DC monitor
-     */
-    if (dc_count > 0)
+    /* ========================================================
+     * ESC register RTT
+     * ======================================================== */
+
+    if (rtt_sample_count > 0)
     {
         qsort(
-            dc_samples,
-            dc_count,
-            sizeof(dc_samples[0]),
-            cmp_u32);
+            rtt_samples,
+            rtt_sample_count,
+            sizeof(rtt_samples[0]),
+            cmp_u64);
 
-        result->dc_p99_us =
-            dc_samples[
+
+        result->rtt_p99_us =
+            rtt_samples[
                 percentile_index(
-                    dc_count,
+                    rtt_sample_count,
                     0.99)]
             /
             1000.0;
 
-        result->dc_max_us =
-            dc_samples[
-                dc_count - 1]
+
+        result->rtt_p999_us =
+            rtt_samples[
+                percentile_index(
+                    rtt_sample_count,
+                    0.999)]
+            /
+            1000.0;
+
+
+        result->rtt_max_us =
+            rtt_samples[
+                rtt_sample_count - 1]
             /
             1000.0;
     }
@@ -1019,53 +1174,65 @@ static int run_frequency_test(
 
 
 /* ============================================================
- * FreeRun table
+ * Result table
  * ============================================================ */
 
-static void print_freerun_table(void)
+static void print_result_table(void)
 {
     printf(
         "\n"
-        "============================================================================================================\n");
+        "=================================================================================================================================\n");
 
     printf(
-        " FreeRun Benchmark - No Master DC Synchronization\n");
+        " EtherCAT FreeRun ESC Register Benchmark - READ 0x%04X\n",
+        ESC_REGISTER_ADDRESS);
 
     printf(
-        "============================================================================================================\n");
+        "=================================================================================================================================\n");
 
 
     printf(
         "%-8s "
+        "%8s "
+        "%9s "
         "%9s "
         "%10s "
-        "%10s "
-        "%11s "
-        "%10s "
+        "%9s "
+        "%9s "
         "%10s "
         "%9s "
+        "%8s "
+        "%8s "
         "%8s\n",
+
         "Rate",
         "Period",
-        "P99.9 Wake",
-        "Max Wake",
-        "P99.9 Send",
-        "Max Send",
-        "Max Exec",
-        "Overrun",
-        "Errors");
+        "Wake999",
+        "WakeMax",
+        "Send999",
+        "SendMax",
+        "ExecMax",
+        "RTT999",
+        "RTTMax",
+        "Late",
+        "Skipped",
+        "RegErr");
 
 
     printf(
         "%-8s "
+        "%8s "
+        "%9s "
         "%9s "
         "%10s "
-        "%10s "
-        "%11s "
-        "%10s "
+        "%9s "
+        "%9s "
         "%10s "
         "%9s "
+        "%8s "
+        "%8s "
         "%8s\n",
+
         "",
         "(us)",
         "(us)",
@@ -1073,22 +1240,27 @@ static void print_freerun_table(void)
         "(us)",
         "(us)",
         "(us)",
+        "(us)",
+        "(us)",
+        "",
         "",
         "");
 
 
     printf(
-        "------------------------------------------------------------------------------------------------------------\n");
+        "---------------------------------------------------------------------------------------------------------------------------------\n");
 
 
     for (size_t i = 0;
-         i < freerun_result_count;
+         i < result_count;
          i++)
     {
         const test_result_t *r =
-            &freerun_results[i];
+            &results[i];
+
 
         char freq[32];
+
 
         format_frequency(
             r->hz,
@@ -1096,21 +1268,14 @@ static void print_freerun_table(void)
             sizeof(freq));
 
 
-        uint64_t errors =
-            r->receive_errors +
-            r->send_errors;
-
-
         printf(
             "%-8s "
+            "%8.2f "
+            "%9.2f "
             "%9.2f "
             "%10.2f "
-            "%10.2f "
-            "%11.2f "
-            "%10.2f "
-            "%10.2f "
-            "%9" PRIu64 " "
-            "%8" PRIu64 "\n",
+            "%9.2f "
+            "%9.2f ",
 
             freq,
 
@@ -1123,167 +1288,131 @@ static void print_freerun_table(void)
 
             r->send_p999_us,
 
-            r->send_max_abs_us,
-
-            r->exec_max_us,
-
-            r->overruns,
-
-            errors);
-    }
-
-
-    printf(
-        "============================================================================================================\n");
-}
-
-
-/* ============================================================
- * DC table
- * ============================================================ */
-
-static void print_dc_table(void)
-{
-    printf(
-        "\n"
-        "========================================================================================================================\n");
-
-    printf(
-        " DC Benchmark - DC Correction 1 kHz / Monitor 100 Hz\n");
-
-    printf(
-        "========================================================================================================================\n");
-
-
-    printf(
-        "%-8s "
-        "%9s "
-        "%10s "
-        "%10s "
-        "%11s "
-        "%10s "
-        "%10s "
-        "%9s "
-        "%9s "
-        "%8s\n",
-
-        "Rate",
-        "Period",
-        "P99.9 Wake",
-        "Max Wake",
-        "P99.9 Send",
-        "Max Send",
-        "Max Exec",
-        "DC Max",
-        "Overrun",
-        "Errors");
-
-
-    printf(
-        "%-8s "
-        "%9s "
-        "%10s "
-        "%10s "
-        "%11s "
-        "%10s "
-        "%10s "
-        "%9s "
-        "%9s "
-        "%8s\n",
-
-        "",
-        "(us)",
-        "(us)",
-        "(us)",
-        "(us)",
-        "(us)",
-        "(us)",
-        "(us)",
-        "",
-        "");
-
-
-    printf(
-        "------------------------------------------------------------------------------------------------------------------------\n");
-
-
-    for (size_t i = 0;
-         i < dc_result_count;
-         i++)
-    {
-        const test_result_t *r =
-            &dc_results[i];
-
-        char freq[32];
-
-        format_frequency(
-            r->hz,
-            freq,
-            sizeof(freq));
-
-
-        uint64_t errors =
-            r->receive_errors +
-            r->send_errors +
-            r->dc_errors;
-
-
-        printf(
-            "%-8s "
-            "%9.2f "
-            "%10.2f "
-            "%10.2f "
-            "%11.2f "
-            "%10.2f "
-            "%10.2f ",
-
-            freq,
-
-            r->period_ns /
-            1000.0,
-
-            r->wake_p999_us,
-
-            r->wake_max_us,
-
-            r->send_p999_us,
-
-            r->send_max_abs_us,
+            r->send_max_us,
 
             r->exec_max_us);
 
 
-        if (r->dc_samples > 0)
+        if (r->rtt_samples > 0)
         {
             printf(
+                "%10.2f "
                 "%9.2f ",
-                r->dc_max_us);
+
+                r->rtt_p999_us,
+                r->rtt_max_us);
         }
         else
         {
             printf(
+                "%10s "
                 "%9s ",
+
+                "-",
                 "-");
         }
 
 
         printf(
-            "%9" PRIu64 " "
+            "%8" PRIu64 " "
+            "%8" PRIu64 " "
             "%8" PRIu64 "\n",
 
-            r->overruns,
-
-            errors);
+            r->late_events,
+            r->skipped_cycles,
+            r->reg_errors);
     }
 
 
     printf(
-        "========================================================================================================================\n");
+        "=================================================================================================================================\n");
+
+
+    printf(
+        "\n"
+        "Wake999 = P99.9 Linux wake-up lateness\n"
+        "WakeMax = maximum Linux wake-up lateness\n"
+        "Send999 = P99.9 absolute ecrt_master_send() interval error\n"
+        "SendMax = maximum absolute ecrt_master_send() interval error\n"
+        "ExecMax = maximum receive/register/send loop execution time\n"
+        "RTT999  = P99.9 ESC register request round-trip time\n"
+        "RTTMax  = maximum ESC register request round-trip time\n"
+        "Late    = number of wake-ups >= one complete target period late\n"
+        "Skipped = number of skipped schedule periods after large lateness\n"
+        "RegErr  = ESC register request errors\n");
 }
 
 
 /* ============================================================
- * main
+ * Register statistics
+ * ============================================================ */
+
+static void print_register_statistics(void)
+{
+    printf(
+        "\n"
+        "ESC register access statistics\n"
+        "--------------------------------------------------------------------------------\n");
+
+
+    printf(
+        "%-8s "
+        "%12s "
+        "%12s "
+        "%12s "
+        "%12s\n",
+
+        "Rate",
+        "Reg OK",
+        "Reg Error",
+        "Busy cycles",
+        "RTT samples");
+
+
+    printf(
+        "--------------------------------------------------------------------------------\n");
+
+
+    for (size_t i = 0;
+         i < result_count;
+         i++)
+    {
+        const test_result_t *r =
+            &results[i];
+
+
+        char freq[32];
+
+
+        format_frequency(
+            r->hz,
+            freq,
+            sizeof(freq));
+
+
+        printf(
+            "%-8s "
+            "%12" PRIu64 " "
+            "%12" PRIu64 " "
+            "%12" PRIu64 " "
+            "%12zu\n",
+
+            freq,
+
+            r->reg_success,
+            r->reg_errors,
+            r->reg_busy_cycles,
+            r->rtt_samples);
+    }
+
+
+    printf(
+        "--------------------------------------------------------------------------------\n");
+}
+
+
+/* ============================================================
+ * Main
  * ============================================================ */
 
 int main(void)
@@ -1292,40 +1421,45 @@ int main(void)
         SIGINT,
         signal_handler);
 
+
     signal(
         SIGTERM,
         signal_handler);
 
 
-    /*
-     * Allocate largest measurement buffers once.
-     */
+    /* ========================================================
+     * Allocate measurement buffers
+     * ======================================================== */
+
     wake_samples =
         calloc(
             MAX_SAMPLES,
             sizeof(*wake_samples));
 
-    send_interval_samples =
+
+    send_samples =
         calloc(
             MAX_SAMPLES,
-            sizeof(*send_interval_samples));
+            sizeof(*send_samples));
+
 
     exec_samples =
         calloc(
             MAX_SAMPLES,
             sizeof(*exec_samples));
 
-    dc_samples =
+
+    rtt_samples =
         calloc(
             MAX_SAMPLES,
-            sizeof(*dc_samples));
+            sizeof(*rtt_samples));
 
 
     if (
         !wake_samples ||
-        !send_interval_samples ||
+        !send_samples ||
         !exec_samples ||
-        !dc_samples)
+        !rtt_samples)
     {
         fprintf(
             stderr,
@@ -1335,23 +1469,10 @@ int main(void)
     }
 
 
-    /*
-     * Avoid paging during realtime benchmark.
-     */
-    if (mlockall(
-            MCL_CURRENT |
-            MCL_FUTURE) != 0)
-    {
-        perror("mlockall");
-    }
+    /* ========================================================
+     * Request EtherCAT master
+     * ======================================================== */
 
-
-    configure_cpu_affinity();
-
-
-    /*
-     * Request EtherCAT master.
-     */
     master =
         ecrt_request_master(
             MASTER_INDEX);
@@ -1361,26 +1482,95 @@ int main(void)
     {
         fprintf(
             stderr,
-            "Cannot request EtherCAT master.\n");
+            "Cannot request EtherCAT master %d.\n",
+            MASTER_INDEX);
+
+        return EXIT_FAILURE;
+    }
+
+
+    /* ========================================================
+     * Detect slave 0 automatically
+     * ======================================================== */
+
+    ec_slave_info_t slave_info;
+
+
+    if (wait_for_slave(
+            &slave_info) != 0)
+    {
+        fprintf(
+            stderr,
+            "No EtherCAT slave found at position %u.\n",
+            SLAVE_POSITION);
+
+
+        ecrt_release_master(
+            master);
+
 
         return EXIT_FAILURE;
     }
 
 
     /*
-     * Automatic DC reference selection.
-     *
-     * Has no effect on FreeRun measurement until
-     * DC synchronization API calls are used.
+     * Create slave configuration using IDs read from the
+     * actual slave.
      */
-    ecrt_master_select_reference_clock(
-        master,
-        NULL);
+    slave_config =
+        ecrt_master_slave_config(
+            master,
+            SLAVE_ALIAS,
+            SLAVE_POSITION,
+            slave_info.vendor_id,
+            slave_info.product_code);
+
+
+    if (!slave_config)
+    {
+        fprintf(
+            stderr,
+            "Cannot create slave configuration.\n");
+
+
+        ecrt_release_master(
+            master);
+
+
+        return EXIT_FAILURE;
+    }
 
 
     /*
-     * Activate master.
+     * Allocate a realtime register request.
+     *
+     * We only need 2 bytes for AL Status.
      */
+    reg_request =
+        ecrt_slave_config_create_reg_request(
+            slave_config,
+            ESC_REGISTER_SIZE);
+
+
+    if (!reg_request)
+    {
+        fprintf(
+            stderr,
+            "Cannot create ESC register request.\n");
+
+
+        ecrt_release_master(
+            master);
+
+
+        return EXIT_FAILURE;
+    }
+
+
+    /* ========================================================
+     * Activate EtherCAT master
+     * ======================================================== */
+
     if (ecrt_master_activate(
             master) != 0)
     {
@@ -1388,30 +1578,83 @@ int main(void)
             stderr,
             "Cannot activate EtherCAT master.\n");
 
+
         ecrt_release_master(
             master);
+
 
         return EXIT_FAILURE;
     }
 
 
     /*
-     * Let master settle.
+     * Give master a short stabilization interval.
      */
     usleep(
         500000);
 
 
-    configure_realtime();
+    /* ========================================================
+     * Lock memory
+     * ======================================================== */
+
+    if (mlockall(
+            MCL_CURRENT |
+            MCL_FUTURE) != 0)
+    {
+        perror(
+            "mlockall");
+    }
 
 
     /* ========================================================
-     * FreeRun
+     * CPU affinity
      * ======================================================== */
 
-    printf(
-        "Running FreeRun benchmark...\n\n");
+    int cpu =
+        configure_cpu_affinity();
 
+
+    /* ========================================================
+     * Realtime scheduler
+     * ======================================================== */
+
+    if (configure_realtime() != 0)
+    {
+        perror(
+            "sched_setscheduler");
+    }
+
+
+    /*
+     * Minimal startup display.
+     */
+    printf(
+        "Running EtherCAT FreeRun ESC benchmark\n");
+
+    printf(
+        "ESC 0x%04X / Slave %u / Vendor 0x%08X / Product 0x%08X",
+        ESC_REGISTER_ADDRESS,
+        SLAVE_POSITION,
+        slave_info.vendor_id,
+        slave_info.product_code);
+
+
+    if (cpu >= 0)
+    {
+        printf(
+            " / CPU %d",
+            cpu);
+    }
+
+
+    printf(
+        "\n\n");
+
+
+    /* ========================================================
+     * Frequency tests
+     * ======================================================== */
 
     for (size_t i = 0;
          i < NUM_TEST_FREQS;
@@ -1421,10 +1664,11 @@ int main(void)
             break;
 
 
-        clear_measurement_buffers();
+        clear_buffers();
 
 
         char freq[32];
+
 
         format_frequency(
             test_frequencies[i],
@@ -1438,125 +1682,47 @@ int main(void)
             (size_t)NUM_TEST_FREQS,
             freq);
 
-        fflush(stdout);
+
+        fflush(
+            stdout);
 
 
-        if (run_frequency_test(
+        if (run_test(
                 test_frequencies[i],
-                MODE_FREERUN,
-                &freerun_results[
-                    freerun_result_count]) != 0)
+                &results[result_count]) != 0)
         {
-            printf("STOP\n");
+            printf(
+                "STOP\n");
 
             break;
         }
 
 
-        freerun_result_count++;
+        result_count++;
 
 
-        printf("done\n");
-    }
-
-
-    /*
-     * Small pause before DC test.
-     */
-    if (!stop_requested)
-    {
-        usleep(
-            500000);
+        printf(
+            "done\n");
     }
 
 
     /* ========================================================
-     * DC mode
+     * Stop realtime scheduler before result formatting
      * ======================================================== */
 
-    if (!stop_requested)
+    restore_scheduler();
+
+
+    /* ========================================================
+     * Results
+     * ======================================================== */
+
+    if (result_count > 0)
     {
-        printf(
-            "\nRunning DC benchmark...\n\n");
+        print_result_table();
 
-
-        for (size_t i = 0;
-             i < NUM_TEST_FREQS;
-             i++)
-        {
-            if (stop_requested)
-                break;
-
-
-            clear_measurement_buffers();
-
-
-            char freq[32];
-
-            format_frequency(
-                test_frequencies[i],
-                freq,
-                sizeof(freq));
-
-
-            printf(
-                "[%zu/%zu] %-8s ... ",
-                i + 1,
-                (size_t)NUM_TEST_FREQS,
-                freq);
-
-            fflush(stdout);
-
-
-            if (run_frequency_test(
-                    test_frequencies[i],
-                    MODE_DC,
-                    &dc_results[
-                        dc_result_count]) != 0)
-            {
-                printf("STOP\n");
-
-                break;
-            }
-
-
-            dc_result_count++;
-
-
-            printf("done\n");
-        }
+        print_register_statistics();
     }
-
-
-    /*
-     * Return to normal scheduler before printing.
-     */
-    restore_normal_scheduler();
-
-
-    /*
-     * Final output only.
-     */
-    if (freerun_result_count > 0)
-    {
-        print_freerun_table();
-    }
-
-
-    if (dc_result_count > 0)
-    {
-        print_dc_table();
-    }
-
-
-    printf(
-        "\n"
-        "Wake = Linux scheduler wake-up delay\n"
-        "Send = interval error between ecrt_master_send() calls\n"
-        "Exec = receive / DC processing / send execution time\n"
-        "DC   = EtherCAT distributed-clock synchronization difference\n"
-        "\n"
-        "P99.9 Send and Max Send use absolute interval error.\n");
 
 
     if (stop_requested)
@@ -1566,16 +1732,19 @@ int main(void)
     }
 
 
-    /*
-     * Cleanup.
-     */
+    /* ========================================================
+     * Cleanup
+     * ======================================================== */
+
     if (master)
     {
         ecrt_master_deactivate(
             master);
 
+
         ecrt_release_master(
             master);
+
 
         master = NULL;
     }
@@ -1584,10 +1753,17 @@ int main(void)
     munlockall();
 
 
-    free(wake_samples);
-    free(send_interval_samples);
-    free(exec_samples);
-    free(dc_samples);
+    free(
+        wake_samples);
+
+    free(
+        send_samples);
+
+    free(
+        exec_samples);
+
+    free(
+        rtt_samples);
 
 
     return EXIT_SUCCESS;
